@@ -9,12 +9,17 @@ import logging
 import os
 import signal
 import sys
+import threading
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 
 import paho.mqtt.client as mqtt
+import yaml
 from dotenv import load_dotenv
 from monitorcontrol import get_monitors
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import numpy as np
 
 load_dotenv()
 
@@ -42,59 +47,105 @@ TOPIC_BRIGHTNESS = "homeassistant/light/brightness_pct"
 TOPIC_REFRESH = "homeassistant/light/refresh"
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.yaml")
+
+
 @dataclass(frozen=True)
 class ValueRange:
     min: int
     max: int
-    offset: int = 0
+    power: float = 1.0
 
 
 @dataclass(frozen=True)
 class MonitorConfig:
+    name: str
     brightness: ValueRange
     contrast: ValueRange
 
 
-MONITOR_CONFIG = MonitorConfig(
-    brightness=ValueRange(min=3, max=100),
-    contrast=ValueRange(min=60, max=92),
-)
+def load_config() -> list[MonitorConfig]:
+    """Load monitor configurations from config.yaml."""
+    with open(CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    configs = []
+    for m in data["monitors"]:
+        configs.append(MonitorConfig(
+            name=m.get("name", "Unknown"),
+            brightness=ValueRange(**m["brightness"]),
+            contrast=ValueRange(**m["contrast"]),
+        ))
+    log.info("Loaded config for %d monitor(s)", len(configs))
+    return configs
 
 
-def percent_to_monitor_value(min_val: int, max_val: int, percent: int) -> int:
+# Global mutable config (reloaded on file change)
+monitor_configs: list[MonitorConfig] = []
+_config_lock = threading.Lock()
+
+
+def reload_config(client: mqtt.Client = None) -> None:
+    """Reload config from YAML file."""
+    global monitor_configs
+    try:
+        new = load_config()
+        with _config_lock:
+            monitor_configs = new
+        
+        if client and client.is_connected():
+            client.publish(TOPIC_REFRESH)
+            log.info("Refresh request sent after config reload")
+    except Exception:
+        log.exception("Failed to reload config, keeping previous values")
+
+
+class ConfigFileHandler(FileSystemEventHandler):
+    """Watches for changes to config.yaml and reloads it."""
+    def __init__(self, client: mqtt.Client):
+        self.client = client
+
+    def on_modified(self, event):
+        if os.path.basename(event.src_path) == "config.yaml":
+            log.info("config.yaml changed, reloading...")
+            reload_config(self.client)
+
+def percent_to_monitor_value(min_val: int, max_val: int, light_level: int, power: float) -> int:
     """Map a 0-100 percentage to a monitor-specific [min_val, max_val] range."""
-    value = (max_val - min_val) * (percent / 100)
-    return min_val + round(value)
+    normalized = light_level / 100.0
+    curved = np.power(normalized, power)
+    scaled_value = min_val + (curved * (max_val - min_val))
+    return int(round(scaled_value))
 
 
-def apply_brightness(percent: int) -> None:
-    """Set brightness on all connected monitors."""
-    cfg = MONITOR_CONFIG.brightness
-    raw = percent_to_monitor_value(cfg.min, cfg.max, percent) + cfg.offset
-    raw = max(cfg.min, min(cfg.max, raw))
+def apply_settings(light_level: int) -> None:
+    """Set brightness and contrast on all connected monitors."""
+    with _config_lock:
+        configs = list(monitor_configs)
 
-    try:
-        for monitor in get_monitors():
+    monitors = get_monitors()
+
+    for i, monitor in enumerate(monitors):
+        # Use per-monitor config if available, otherwise fall back to the last one
+        cfg = configs[min(i, len(configs) - 1)]
+
+        brightness_raw = percent_to_monitor_value(cfg.brightness.min, cfg.brightness.max, light_level, cfg.brightness.power)
+        brightness_raw = max(cfg.brightness.min, min(cfg.brightness.max, brightness_raw))
+
+        contrast_raw = percent_to_monitor_value(cfg.contrast.min, cfg.contrast.max, light_level, cfg.contrast.power)
+        contrast_raw = max(cfg.contrast.min, min(cfg.contrast.max, contrast_raw))
+
+        try:
             with monitor:
-                monitor.set_luminance(raw)
-        log.info("Brightness set to %d%% (converted to %d%%)", percent, raw)
-    except Exception:
-        log.exception("Failed to set brightness")
-
-
-def apply_contrast(percent: int) -> None:
-    """Set contrast on all connected monitors."""
-    cfg = MONITOR_CONFIG.contrast
-    raw = percent_to_monitor_value(cfg.min, cfg.max, percent) + cfg.offset
-    raw = max(cfg.min, min(cfg.max, raw))  # clamp
-
-    try:
-        for monitor in get_monitors():
-            with monitor:
-                monitor.set_contrast(raw)
-        log.info("Contrast set to %d%% (converted to %d%%)", percent, raw)
-    except Exception:
-        log.exception("Failed to set contrast")
+                monitor.set_luminance(brightness_raw)
+                monitor.set_contrast(contrast_raw)
+            log.info(
+                "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
+                cfg.name, light_level, brightness_raw, light_level, contrast_raw,
+            )
+        except Exception:
+            log.exception("Failed to set monitor %d (%s)", i, cfg.name)
 
 
 def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties):
@@ -127,13 +178,15 @@ def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage):
         return
 
     if msg.topic == TOPIC_BRIGHTNESS:
-        apply_brightness(value)
-        apply_contrast(value)
+        apply_settings(value)
     else:
         log.debug("Ignored topic %s", msg.topic)
 
 
-def main() -> None:
+def main():
+    # Load config on startup
+    reload_config()
+
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
     client.username_pw_set(
@@ -152,9 +205,15 @@ def main() -> None:
     log.info("Connecting to %s ...", host)
     client.connect(host)
 
+    # Watch config.yaml for live changes (started after client so we can refresh)
+    observer = Observer()
+    observer.schedule(ConfigFileHandler(client), path=SCRIPT_DIR, recursive=False)
+    observer.start()
+
     # Graceful shutdown on Ctrl+C or system signal.
     def shutdown(_sig, _frame):
         log.info("Shutting down...")
+        observer.stop()
         client.disconnect()
         client.loop_stop()
         sys.exit(0)

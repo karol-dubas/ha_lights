@@ -1,0 +1,10 @@
+monitors:
+  - name: "1"
+    brightness:
+      min: 3
+      max: 100
+      power: 2.5
+    contrast:
+      min: 60
+      max: 92
+      power: 2.5
