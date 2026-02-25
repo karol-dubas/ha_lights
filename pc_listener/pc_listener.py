@@ -13,13 +13,13 @@ import threading
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 
+import numpy as np
 import paho.mqtt.client as mqtt
 import yaml
 from dotenv import load_dotenv
 from monitorcontrol import get_monitors
-from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import numpy as np
+from watchdog.observers import Observer
 
 load_dotenv()
 
@@ -72,11 +72,13 @@ def load_config() -> list[MonitorConfig]:
 
     configs = []
     for m in data["monitors"]:
-        configs.append(MonitorConfig(
-            name=m.get("name", "Unknown"),
-            brightness=ValueRange(**m["brightness"]),
-            contrast=ValueRange(**m["contrast"]),
-        ))
+        configs.append(
+            MonitorConfig(
+                name=m.get("name", "Unknown"),
+                brightness=ValueRange(**m["brightness"]),
+                contrast=ValueRange(**m["contrast"]),
+            )
+        )
     log.info("Loaded config for %d monitor(s)", len(configs))
     return configs
 
@@ -93,7 +95,7 @@ def reload_config(client: mqtt.Client = None) -> None:
         new = load_config()
         with _config_lock:
             monitor_configs = new
-        
+
         if client and client.is_connected():
             client.publish(TOPIC_REFRESH)
             log.info("Refresh request sent after config reload")
@@ -103,6 +105,7 @@ def reload_config(client: mqtt.Client = None) -> None:
 
 class ConfigFileHandler(FileSystemEventHandler):
     """Watches for changes to config.yaml and reloads it."""
+
     def __init__(self, client: mqtt.Client):
         self.client = client
 
@@ -111,7 +114,10 @@ class ConfigFileHandler(FileSystemEventHandler):
             log.info("config.yaml changed, reloading...")
             reload_config(self.client)
 
-def percent_to_monitor_value(min_val: int, max_val: int, light_level: int, power: float) -> int:
+
+def percent_to_monitor_value(
+    min_val: int, max_val: int, light_level: int, power: float
+) -> int:
     """Map a 0-100 percentage to a monitor-specific [min_val, max_val] range."""
     normalized = light_level / 100.0
     curved = np.power(normalized, power)
@@ -130,10 +136,16 @@ def apply_settings(light_level: int) -> None:
         # Use per-monitor config if available, otherwise fall back to the last one
         cfg = configs[min(i, len(configs) - 1)]
 
-        brightness_raw = percent_to_monitor_value(cfg.brightness.min, cfg.brightness.max, light_level, cfg.brightness.power)
-        brightness_raw = max(cfg.brightness.min, min(cfg.brightness.max, brightness_raw))
+        brightness_raw = percent_to_monitor_value(
+            cfg.brightness.min, cfg.brightness.max, light_level, cfg.brightness.power
+        )
+        brightness_raw = max(
+            cfg.brightness.min, min(cfg.brightness.max, brightness_raw)
+        )
 
-        contrast_raw = percent_to_monitor_value(cfg.contrast.min, cfg.contrast.max, light_level, cfg.contrast.power)
+        contrast_raw = percent_to_monitor_value(
+            cfg.contrast.min, cfg.contrast.max, light_level, cfg.contrast.power
+        )
         contrast_raw = max(cfg.contrast.min, min(cfg.contrast.max, contrast_raw))
 
         try:
@@ -142,7 +154,11 @@ def apply_settings(light_level: int) -> None:
                 monitor.set_contrast(contrast_raw)
             log.info(
                 "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
-                cfg.name, light_level, brightness_raw, light_level, contrast_raw,
+                cfg.name,
+                light_level,
+                brightness_raw,
+                light_level,
+                contrast_raw,
             )
         except Exception:
             log.exception("Failed to set monitor %d (%s)", i, cfg.name)
@@ -202,8 +218,18 @@ def main():
     client.reconnect_delay_set(min_delay=1, max_delay=60)
 
     host = os.environ["HA_MQTT_Address"]
-    log.info("Connecting to %s ...", host)
-    client.connect(host)
+    delay = 1
+    while True:
+        try:
+            log.info("Connecting to %s ...", host)
+            client.connect(host)
+            break
+        except OSError:
+            log.warning("Connection failed, retrying in %ds...", delay)
+            import time
+
+            time.sleep(delay)
+            delay = min(delay := delay + 1, 60)
 
     # Watch config.yaml for live changes (started after client so we can refresh)
     observer = Observer()
