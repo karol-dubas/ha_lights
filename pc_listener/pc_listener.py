@@ -12,6 +12,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -85,6 +86,7 @@ def load_config() -> list[MonitorConfig]:
 
 # Global mutable config (reloaded on file change)
 monitor_configs: list[MonitorConfig] = []
+last_values: dict[str, Any] = {}
 _config_lock = threading.Lock()
 
 
@@ -139,29 +141,45 @@ def apply_settings(light_level: int) -> None:
         brightness_raw = percent_to_monitor_value(
             cfg.brightness.min, cfg.brightness.max, light_level, cfg.brightness.power
         )
-        brightness_raw = max(
+        brightness_dst = max(
             cfg.brightness.min, min(cfg.brightness.max, brightness_raw)
         )
 
         contrast_raw = percent_to_monitor_value(
             cfg.contrast.min, cfg.contrast.max, light_level, cfg.contrast.power
         )
-        contrast_raw = max(cfg.contrast.min, min(cfg.contrast.max, contrast_raw))
+        contrast_dst = max(cfg.contrast.min, min(cfg.contrast.max, contrast_raw))
 
         try:
             with monitor:
-                monitor.set_luminance(brightness_raw)
-                monitor.set_contrast(contrast_raw)
-            log.info(
-                "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
-                cfg.name,
-                light_level,
-                brightness_raw,
-                light_level,
-                contrast_raw,
-            )
+                changed = False
+                if last_values.get("brightness") != brightness_dst:
+                    monitor.set_luminance(brightness_dst)
+                    last_values["brightness"] = brightness_dst
+                    changed = True
+
+                if last_values.get("contrast") != contrast_dst:
+                    monitor.set_contrast(contrast_dst)
+                    last_values["contrast"] = contrast_dst
+                    changed = True
+
+            if changed:
+                log.info(
+                    "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
+                    cfg.name,
+                    light_level,
+                    brightness_dst,
+                    light_level,
+                    contrast_dst,
+                )
         except Exception:
-            log.exception("Failed to set monitor %d (%s)", i, cfg.name)
+            log.exception(
+                "Failed to set monitor %d (%s): brightness=%d, contrast=%d",
+                i,
+                cfg.name,
+                brightness_dst,
+                contrast_dst,
+            )
 
 
 def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties):
