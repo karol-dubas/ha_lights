@@ -6,13 +6,13 @@ Designed to run continuously as a startup script.
 """
 
 import logging
+import math
 import os
 import signal
 import sys
 import threading
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Any
 
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -44,7 +44,7 @@ logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler]
 log = logging.getLogger(__name__)
 
 TOPIC_BRIGHTNESS = "homeassistant/light/brightness_pct"
-# TOPIC_COLOR_TEMP = "homeassistant/light/color_temp_k"
+TOPIC_COLOR_TEMP = "homeassistant/light/color_temp_k"
 TOPIC_REFRESH = "homeassistant/light/refresh"
 
 
@@ -86,7 +86,6 @@ def load_config() -> list[MonitorConfig]:
 
 # Global mutable config (reloaded on file change)
 monitor_configs: list[MonitorConfig] = []
-last_values: dict[str, Any] = {}
 _config_lock = threading.Lock()
 
 
@@ -127,7 +126,53 @@ def percent_to_monitor_value(
     return int(round(scaled_value))
 
 
-def apply_settings(light_level: int) -> None:
+def kelvin_to_rgb(kelvin: int) -> tuple[int, int, int]:
+    """Convert color temperature in Kelvin to RGB gain values (0-255)."""
+    temp = kelvin / 100.0
+
+    r = 255
+    g = int(max(0, min(255, 99.4708025861 * math.log(temp) - 161.1195681661)))
+
+    if temp <= 19:
+        b = 0
+    else:
+        b = int(max(0, min(255, 138.5177312231 * math.log(temp - 10) - 305.0447927307)))
+
+    return r, g, b
+
+
+def set_monitor_rgb(monitor, r, g, b):
+    monitor.vcp.set_vcp_feature(0x16, r)
+    monitor.vcp.set_vcp_feature(0x18, g)
+    monitor.vcp.set_vcp_feature(0x1A, b)
+
+
+def apply_color_temperature(kelvin: int) -> None:
+    """Set color temperature on all connected monitors via RGB gain VCP codes."""
+    # TODO: refactor `homeassistant/light/color_temp_k` to
+    # `color_temp` (0-100) and configure each monitor in the config.
+    # For now, only `cfg.name` is used.
+
+    r, g, b = kelvin_to_rgb(kelvin)
+    monitors = get_monitors()
+
+    for i, monitor in enumerate(monitors):
+        try:
+            with monitor:
+                set_monitor_rgb(monitor, r, g, b)
+        except Exception:
+            log.exception(
+                "Failed to set color temp on monitor %d: %dK (R:%d G:%d B:%d)",
+                i,
+                kelvin,
+                r,
+                g,
+                b,
+            )
+        log.info("[%d] Color temp %dK -> R:%d G:%d B:%d", i, kelvin, r, g, b)
+
+
+def apply_brightness_contrast(light_level: int) -> None:
     """Set brightness and contrast on all connected monitors."""
     with _config_lock:
         configs = list(monitor_configs)
@@ -152,26 +197,8 @@ def apply_settings(light_level: int) -> None:
 
         try:
             with monitor:
-                changed = False
-                if last_values.get("brightness") != brightness_dst:
-                    monitor.set_luminance(brightness_dst)
-                    last_values["brightness"] = brightness_dst
-                    changed = True
-
-                if last_values.get("contrast") != contrast_dst:
-                    monitor.set_contrast(contrast_dst)
-                    last_values["contrast"] = contrast_dst
-                    changed = True
-
-            if changed:
-                log.info(
-                    "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
-                    cfg.name,
-                    light_level,
-                    brightness_dst,
-                    light_level,
-                    contrast_dst,
-                )
+                monitor.set_luminance(brightness_dst)
+                monitor.set_contrast(contrast_dst)
         except Exception:
             log.exception(
                 "Failed to set monitor %d (%s): brightness=%d, contrast=%d",
@@ -180,6 +207,14 @@ def apply_settings(light_level: int) -> None:
                 brightness_dst,
                 contrast_dst,
             )
+        log.info(
+            "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
+            cfg.name,
+            light_level,
+            brightness_dst,
+            light_level,
+            contrast_dst,
+        )
 
 
 def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties):
@@ -190,7 +225,8 @@ def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties)
         return
 
     client.subscribe(TOPIC_BRIGHTNESS)
-    log.info("Subscribed to %s", TOPIC_BRIGHTNESS)
+    client.subscribe(TOPIC_COLOR_TEMP)
+    log.info("Subscribed to %s, %s", TOPIC_BRIGHTNESS, TOPIC_COLOR_TEMP)
 
     # Ask for current values right away (useful after boot / wake).
     client.publish(TOPIC_REFRESH)
@@ -212,7 +248,9 @@ def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage):
         return
 
     if msg.topic == TOPIC_BRIGHTNESS:
-        apply_settings(value)
+        apply_brightness_contrast(value)
+    elif msg.topic == TOPIC_COLOR_TEMP:
+        apply_color_temperature(value)
     else:
         log.debug("Ignored topic %s", msg.topic)
 
