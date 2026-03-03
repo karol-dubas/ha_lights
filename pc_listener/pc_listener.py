@@ -6,13 +6,13 @@ Designed to run continuously as a startup script.
 """
 
 import logging
-import math
 import os
 import signal
 import sys
 import threading
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from monitorcontrol import get_monitors
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+from win_nightlight import NightLight
 
 load_dotenv()
 
@@ -44,7 +45,7 @@ logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler]
 log = logging.getLogger(__name__)
 
 TOPIC_BRIGHTNESS = "homeassistant/light/brightness_pct"
-TOPIC_COLOR_TEMP = "homeassistant/light/color_temp_k"
+TOPIC_COLOR_TEMP = "homeassistant/light/color_temp_pct"
 TOPIC_REFRESH = "homeassistant/light/refresh"
 
 
@@ -66,13 +67,19 @@ class MonitorConfig:
     contrast: ValueRange
 
 
-def load_config() -> list[MonitorConfig]:
+@dataclass(frozen=True)
+class GlobalConfig:
+    monitors: list[MonitorConfig]
+    color_temp: ValueRange
+
+
+def load_config() -> GlobalConfig:
     """Load monitor configurations from config.yaml."""
     with open(CONFIG_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     configs = []
-    for m in data["monitors"]:
+    for m in data.get("monitors", []):
         configs.append(
             MonitorConfig(
                 name=m.get("name", "Unknown"),
@@ -80,22 +87,27 @@ def load_config() -> list[MonitorConfig]:
                 contrast=ValueRange(**m["contrast"]),
             )
         )
-    log.info("Loaded config for %d monitor(s)", len(configs))
-    return configs
+
+    ct_data = data.get("color_temp", {"min": 0, "max": 100, "power": 1.0})
+    ct_cfg = ValueRange(**ct_data)
+
+    log.info("Loaded config for %d monitor(s) and global color temp", len(configs))
+    return GlobalConfig(monitors=configs, color_temp=ct_cfg)
 
 
 # Global mutable config (reloaded on file change)
-monitor_configs: list[MonitorConfig] = []
+app_config: GlobalConfig = None
+last_values: dict[str, Any] = {}
 _config_lock = threading.Lock()
 
 
 def reload_config(client: mqtt.Client = None) -> None:
     """Reload config from YAML file."""
-    global monitor_configs
+    global app_config
     try:
         new = load_config()
         with _config_lock:
-            monitor_configs = new
+            app_config = new
 
         if client and client.is_connected():
             client.publish(TOPIC_REFRESH)
@@ -117,65 +129,64 @@ class ConfigFileHandler(FileSystemEventHandler):
 
 
 def percent_to_monitor_value(
-    min_val: int, max_val: int, light_level: int, power: float
+    min_val: int, max_val: int, level: int, power: float, invert: bool = False
 ) -> int:
     """Map a 0-100 percentage to a monitor-specific [min_val, max_val] range."""
-    normalized = light_level / 100.0
+    normalized = level / 100.0
     curved = np.power(normalized, power)
-    scaled_value = min_val + (curved * (max_val - min_val))
+    if invert:
+        scaled_value = max_val - (curved * (max_val - min_val))
+    else:
+        scaled_value = min_val + (curved * (max_val - min_val))
     return int(round(scaled_value))
 
 
-def kelvin_to_rgb(kelvin: int) -> tuple[int, int, int]:
-    """Convert color temperature in Kelvin to RGB gain values (0-255)."""
-    temp = kelvin / 100.0
-
-    r = 255
-    g = int(max(0, min(255, 99.4708025861 * math.log(temp) - 161.1195681661)))
-
-    if temp <= 19:
-        b = 0
-    else:
-        b = int(max(0, min(255, 138.5177312231 * math.log(temp - 10) - 305.0447927307)))
-
-    return r, g, b
+night_light = NightLight()
 
 
-def set_monitor_rgb(monitor, r, g, b):
-    monitor.vcp.set_vcp_feature(0x16, r)
-    monitor.vcp.set_vcp_feature(0x18, g)
-    monitor.vcp.set_vcp_feature(0x1A, b)
+def apply_color_temperature(level: int) -> None:
+    """Set Windows Night Light strength based on percentage."""
+    with _config_lock:
+        if not app_config:
+            return
+        ct_cfg = app_config.color_temp
 
+    strength_raw = percent_to_monitor_value(
+        ct_cfg.min, ct_cfg.max, level, ct_cfg.power, invert=True
+    )
+    strength_dst = max(ct_cfg.min, min(ct_cfg.max, strength_raw))
 
-def apply_color_temperature(kelvin: int) -> None:
-    """Set color temperature on all connected monitors via RGB gain VCP codes."""
-    # TODO: refactor `homeassistant/light/color_temp_k` to
-    # `color_temp` (0-100) and configure each monitor in the config.
-    # For now, only `cfg.name` is used.
+    try:
+        if night_light.supported() and not night_light.enabled():
+            night_light.enable()
 
-    r, g, b = kelvin_to_rgb(kelvin)
-    monitors = get_monitors()
+        changed = False
+        if last_values.get("color_temp") != strength_dst:
+            if night_light.supported():
+                night_light.set_strength(strength_dst)
+            last_values["color_temp"] = strength_dst
+            changed = True
 
-    for i, monitor in enumerate(monitors):
-        try:
-            with monitor:
-                set_monitor_rgb(monitor, r, g, b)
-        except Exception:
-            log.exception(
-                "Failed to set color temp on monitor %d: %dK (R:%d G:%d B:%d)",
-                i,
-                kelvin,
-                r,
-                g,
-                b,
+        if changed:
+            log.info(
+                "Color temp %d%% -> %d%%",
+                level,
+                strength_dst,
             )
-        log.info("[%d] Color temp %dK -> R:%d G:%d B:%d", i, kelvin, r, g, b)
+    except Exception:
+        log.exception(
+            "Failed to set color temp %d%% -> %d%%",
+            level,
+            strength_dst,
+        )
 
 
 def apply_brightness_contrast(light_level: int) -> None:
     """Set brightness and contrast on all connected monitors."""
     with _config_lock:
-        configs = list(monitor_configs)
+        if not app_config:
+            return
+        configs = list(app_config.monitors)
 
     monitors = get_monitors()
 
@@ -197,8 +208,26 @@ def apply_brightness_contrast(light_level: int) -> None:
 
         try:
             with monitor:
-                monitor.set_luminance(brightness_dst)
-                monitor.set_contrast(contrast_dst)
+                changed = False
+                if last_values.get(f"mon_{i}_brightness") != brightness_dst:
+                    monitor.set_luminance(brightness_dst)
+                    last_values[f"mon_{i}_brightness"] = brightness_dst
+                    changed = True
+
+                if last_values.get(f"mon_{i}_contrast") != contrast_dst:
+                    monitor.set_contrast(contrast_dst)
+                    last_values[f"mon_{i}_contrast"] = contrast_dst
+                    changed = True
+
+            if changed:
+                log.info(
+                    "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
+                    cfg.name,
+                    light_level,
+                    brightness_dst,
+                    light_level,
+                    contrast_dst,
+                )
         except Exception:
             log.exception(
                 "Failed to set monitor %d (%s): brightness=%d, contrast=%d",
@@ -207,14 +236,6 @@ def apply_brightness_contrast(light_level: int) -> None:
                 brightness_dst,
                 contrast_dst,
             )
-        log.info(
-            "[%s] Brightness %d%% -> %d%%, Contrast %d%% -> %d%%",
-            cfg.name,
-            light_level,
-            brightness_dst,
-            light_level,
-            contrast_dst,
-        )
 
 
 def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties):

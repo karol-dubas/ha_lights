@@ -1,10 +1,14 @@
 monitors:
-  - name: "1"
+  - name: "Primary"
     brightness:
       min: 0
       max: 100
-      power: 4
+      power: 3.5
     contrast:
       min: 50
       max: 92
       power: 3
+color_temp:
+  min: 0
+  max: 90
+  power: 1

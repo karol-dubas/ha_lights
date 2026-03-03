@@ -22,3 +22,6 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Description "MQTT listener for monitor brightness/contrast" -Force
+
+# Stop-ScheduledTask -TaskName "MonitorMQTTListener"
+# Start-ScheduledTask -TaskName "MonitorMQTTListener"
