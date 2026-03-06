@@ -48,9 +48,12 @@ TOPIC_BRIGHTNESS = "homeassistant/light/brightness_pct"
 TOPIC_COLOR_TEMP = "homeassistant/light/color_temp_pct"
 TOPIC_REFRESH = "homeassistant/light/refresh"
 
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.yaml")
+
+night_light = NightLight()
+if not night_light.enabled():
+    night_light.enable()
 
 
 @dataclass(frozen=True)
@@ -141,9 +144,6 @@ def percent_to_monitor_value(
     return int(round(scaled_value))
 
 
-night_light = NightLight()
-
-
 def apply_color_temperature(level: int) -> None:
     """Set Windows Night Light strength based on percentage."""
     with _config_lock:
@@ -157,17 +157,9 @@ def apply_color_temperature(level: int) -> None:
     strength_dst = max(ct_cfg.min, min(ct_cfg.max, strength_raw))
 
     try:
-        if night_light.supported() and not night_light.enabled():
-            night_light.enable()
-
-        changed = False
         if last_values.get("color_temp") != strength_dst:
-            if night_light.supported():
-                night_light.set_strength(strength_dst)
+            night_light.set_strength(strength_dst)
             last_values["color_temp"] = strength_dst
-            changed = True
-
-        if changed:
             log.info(
                 "Color temp %d%% -> %d%%",
                 level,
