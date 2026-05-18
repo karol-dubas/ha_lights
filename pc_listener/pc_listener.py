@@ -255,7 +255,7 @@ def on_disconnect(client: mqtt.Client, _userdata, _flags, reason_code, _properti
 
 def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage):
     try:
-        value = int(msg.payload.decode())
+        value = round(float(msg.payload.decode()))
     except (ValueError, UnicodeDecodeError):
         log.warning("Invalid payload on %s: %r", msg.topic, msg.payload)
         return
