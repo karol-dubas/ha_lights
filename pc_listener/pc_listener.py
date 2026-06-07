@@ -21,7 +21,8 @@ from dotenv import load_dotenv
 from monitorcontrol import get_monitors
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
-from win_nightlight import NightLight
+
+# from win_nightlight import NightLight
 
 load_dotenv()
 
@@ -51,9 +52,9 @@ TOPIC_REFRESH = "homeassistant/light/refresh"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.yaml")
 
-night_light = NightLight()
-if not night_light.enabled():
-    night_light.enable()
+# night_light = NightLight()
+# if not night_light.enabled():
+#     night_light.enable()
 
 
 @dataclass(frozen=True)
@@ -238,7 +239,7 @@ def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties)
         return
 
     client.subscribe(TOPIC_BRIGHTNESS)
-    client.subscribe(TOPIC_COLOR_TEMP)
+    # client.subscribe(TOPIC_COLOR_TEMP)
     log.info("Subscribed to %s, %s", TOPIC_BRIGHTNESS, TOPIC_COLOR_TEMP)
 
     # Ask for current values right away (useful after boot / wake).
